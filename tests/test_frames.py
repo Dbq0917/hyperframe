@@ -113,6 +113,71 @@ class TestGeneralFrameBehaviour:
             Frame.parse_frame_header(b'\x00\x00\x08\x00\x01\x00\x00\x00')
 
 
+class TestFrameBodyBoundary:
+    def test_parse_frame_header_sets_body_len(self):
+        frame, length = Frame.parse_frame_header(
+            b'\x00\x00\x08\x00\x01\x00\x00\x00\x01'
+        )
+        assert length == 8
+        assert frame.body_len == 8
+
+    @pytest.mark.parametrize('frame', [
+        DataFrame(1, data=b'testdata'),
+        HeadersFrame(1, data=b'hello world'),
+        PriorityFrame(1, depends_on=4, stream_weight=64),
+        RstStreamFrame(1, error_code=420),
+        SettingsFrame(settings={1: 8192}),
+        PushPromiseFrame(1, promised_stream_id=2, data=b'hello'),
+        PingFrame(opaque_data=b'12345678'),
+        GoAwayFrame(last_stream_id=64, error_code=32, additional_data=b'hi'),
+        WindowUpdateFrame(1, window_increment=1024),
+        ContinuationFrame(1, data=b'hello'),
+        AltSvcFrame(1, origin=b'', field=b'h2=":8000"'),
+    ], ids=lambda f: type(f).__name__)
+    def test_truncated_body_is_rejected(self, frame):
+        # The header declares more bytes than have arrived: parsing must
+        # fail instead of silently parsing a truncated body.
+        wire = frame.serialize()
+        f, length = Frame.parse_frame_header(memoryview(wire[:9]))
+        assert length > 0
+        with pytest.raises(InvalidFrameError):
+            f.parse_body(memoryview(wire[9:-1]))
+
+    def test_overlong_body_is_rejected(self):
+        # More bytes than declared must not be consumed either: those bytes
+        # belong to the next frame on the wire.
+        wire = DataFrame(1, data=b'testdata').serialize() + b'\x00'
+        f, length = Frame.parse_frame_header(memoryview(wire[:9]))
+        with pytest.raises(InvalidFrameError):
+            f.parse_body(memoryview(wire[9:9 + length + 1]))
+
+    def test_incomplete_frame_waits_and_stream_stays_in_sync(self):
+        # A header declares 1000 body bytes, but only 900 have arrived.
+        # Reading the declared length anyway would steal 100 bytes from the
+        # next frame and desynchronize everything behind it.
+        f1 = DataFrame(1, data=b'x' * 1000)
+        f2 = DataFrame(2, data=b'y' * 10)
+        wire = f1.serialize() + f2.serialize()
+
+        frame, length = Frame.parse_frame_header(memoryview(wire[:9]))
+        assert length == 1000
+
+        # Not enough data yet: the frame must not be parsed.
+        with pytest.raises(InvalidFrameError):
+            frame.parse_body(memoryview(wire[9:9 + 900]))
+
+        # Once the rest of the body arrives, the same frame parses fine.
+        frame.parse_body(memoryview(wire[9:9 + length]))
+        assert frame.data == b'x' * 1000
+
+        # The following frame is exactly where it should be and parses too.
+        rest = wire[9 + length:]
+        frame2, length2 = Frame.parse_frame_header(memoryview(rest[:9]))
+        frame2.parse_body(memoryview(rest[9:9 + length2]))
+        assert frame2.stream_id == 2
+        assert frame2.data == b'y' * 10
+
+
 class TestDataFrame:
     payload = b'\x00\x00\x08\x00\x01\x00\x00\x00\x01testdata'
     payload_with_padding = (

@@ -19,6 +19,12 @@ dev
 
 **Bugfixes**
 
+- Frame bodies are now checked against the length declared in the frame
+  header: ``parse_body`` raises ``InvalidFrameError`` when it receives fewer
+  or more bytes than declared, instead of silently parsing a truncated body
+  or consuming bytes that belong to the next frame. ``parse_frame_header``
+  now also populates ``body_len`` with the declared length, so callers can
+  wait for the complete body before parsing.
 -
 
 6.1.0 (2025-01-22)

@@ -102,6 +102,27 @@ class Frame:
         print(frame)  # noqa: T201
         return frame, length
 
+    def _validate_body_length(self, data: memoryview) -> None:
+        """
+        Validates that the body data about to be parsed contains exactly as
+        many bytes as the frame header declared.
+
+        This guards the receive boundary: if fewer bytes than declared have
+        arrived, the caller must wait for more data instead of parsing a
+        truncated body. If more bytes than declared are passed, bytes
+        belonging to the next frame would be consumed. Both cases must be
+        rejected to keep the frame stream in sync.
+
+        :raises hyperframe.exceptions.InvalidFrameError: If the data length
+            does not match the declared body length.
+        """
+        if len(data) != self.body_len:
+            msg = (
+                f"{type(self).__name__} frame body length mismatch: "
+                f"header declares {self.body_len} bytes, got {len(data)} bytes"
+            )
+            raise InvalidFrameError(msg)
+
     @staticmethod
     def parse_frame_header(header: memoryview, strict: bool = False) -> tuple[Frame, int]:
         """
@@ -140,6 +161,10 @@ class Frame:
             if strict:
                 raise UnknownFrameError(typ_e, length) from err
             frame = ExtensionFrame(type=typ_e, stream_id=stream_id)
+
+        # Record the declared body length so that parse_body can verify that
+        # exactly this many bytes are passed to it.
+        frame.body_len = length
 
         frame.parse_flags(flags)
         return (frame, length)
@@ -187,9 +212,14 @@ class Frame:
         stream ID or flags.
 
         :param data: A memoryview object containing the body data of the frame.
-                     Must not contain *more* data than the length returned by
+                     Must contain *exactly* the number of bytes returned by
                      :meth:`parse_frame_header
-                     <hyperframe.frame.Frame.parse_frame_header>`.
+                     <hyperframe.frame.Frame.parse_frame_header>`. If fewer
+                     bytes have arrived so far, wait for the rest of the body
+                     before calling this method.
+
+        :raises hyperframe.exceptions.InvalidFrameError: If the data does not
+            contain exactly the declared number of body bytes.
         """
         raise NotImplementedError
 
@@ -307,6 +337,7 @@ class DataFrame(Padding, Frame):
         return b"".join([padding_data, self.data, padding])
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         padding_data_length = self.parse_padding_data(data)
         self.data = (
             data[padding_data_length:len(data)-self.pad_length].tobytes()
@@ -353,6 +384,7 @@ class PriorityFrame(Priority, Frame):
         return self.serialize_priority_data()
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         if len(data) > 5:
             msg = f"PRIORITY must have 5 byte body: actual length {len(data)}."
             raise InvalidFrameError(msg)
@@ -392,6 +424,7 @@ class RstStreamFrame(Frame):
         return _STRUCT_L.pack(self.error_code)
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         if len(data) != 4:
             msg = f"RST_STREAM must have 4 byte body: actual length {len(data)}."
             raise InvalidFrameError(msg)
@@ -468,6 +501,7 @@ class SettingsFrame(Frame):
             msg = f"SETTINGS ack frame must not have payload: got {len(data)} bytes"
             raise InvalidDataError(msg)
 
+        self._validate_body_length(data)
         body_len = 0
         for i in range(0, len(data), 6):
             try:
@@ -519,6 +553,7 @@ class PushPromiseFrame(Padding, Frame):
         return b"".join([padding_data, data, self.data, padding])
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         padding_data_length = self.parse_padding_data(data)
 
         try:
@@ -577,6 +612,7 @@ class PingFrame(Frame):
         return data
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         if len(data) != 8:
             msg = f"PING frame must have 8 byte length: got {len(data)}"
             raise InvalidFrameError(msg)
@@ -631,6 +667,7 @@ class GoAwayFrame(Frame):
         return data
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         try:
             self.last_stream_id, self.error_code = _STRUCT_LL.unpack(
                 data[:8],
@@ -684,6 +721,7 @@ class WindowUpdateFrame(Frame):
         )
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         if len(data) > 4:
             msg = f"WINDOW_UPDATE frame must have 4 byte length: got {len(data)}"
             raise InvalidFrameError(msg)
@@ -751,6 +789,7 @@ class HeadersFrame(Padding, Priority, Frame):
         return b"".join([padding_data, priority_data, self.data, padding])
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         padding_data_length = self.parse_padding_data(data)
         data = data[padding_data_length:]
 
@@ -801,6 +840,7 @@ class ContinuationFrame(Frame):
         return self.data
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         self.data = data.tobytes()
         self.body_len = len(data)
 
@@ -845,6 +885,7 @@ class AltSvcFrame(Frame):
         return b"".join([origin_len, self.origin, self.field])
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         try:
             origin_len = _STRUCT_H.unpack(data[0:2])[0]
             self.origin = data[2:2+origin_len].tobytes()
@@ -895,6 +936,7 @@ class ExtensionFrame(Frame):
         self.flag_byte = flag_byte
 
     def parse_body(self, data: memoryview) -> None:
+        self._validate_body_length(data)
         self.body = data.tobytes()
         self.body_len = len(data)
 
